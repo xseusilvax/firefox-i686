@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         Empire → Surebet Scanner
 // @namespace    surebet-scanner
-// @version      1.1
+// @version      1.2
 // @description  Envia eventos do Empire para o scanner local
 // @match        https://csgoempire.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
-// @connect      csgoempire.com
 // @run-at       document-start
 // ==/UserScript==
 
@@ -14,79 +13,100 @@
   'use strict';
 
   const FEED     = 'http://127.0.0.1:4001/empire-feed';
-  const API      = 'https://csgoempire.com/api/v2/match-betting/flattened?page=1&per_page=100';
-  const TARGET   = '/api/v2/match-betting/flattened';
-  const INTERVAL = 10000; // busca ativa a cada 10s
+  const API      = '/api/v2/match-betting/flattened?page=1&per_page=100';
+  const INTERVAL = 10000;
 
-  function send(items) {
+  // Indicador visual na pagina do Empire
+  function criarIndicador() {
+    var el = document.createElement('div');
+    el.id = 'sb-status';
+    el.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;'+
+      'background:#161b22;border:1px solid #30363d;border-radius:8px;'+
+      'padding:8px 14px;font-family:monospace;font-size:12px;color:#7d8590;'+
+      'box-shadow:0 4px 12px rgba(0,0,0,.4);cursor:default;user-select:none';
+    el.textContent = 'SUREBET: iniciando...';
+    document.body.appendChild(el);
+    return el;
+  }
+
+  var badge = null;
+  function setBadge(texto, cor) {
+    if (!badge) {
+      if (!document.body) return;
+      badge = criarIndicador();
+    }
+    badge.textContent = 'SUREBET: ' + texto;
+    badge.style.color = cor || '#7d8590';
+    badge.style.borderColor = cor || '#30363d';
+  }
+
+  // Envia para o scanner via GM_xmlhttpRequest (unica chamada que precisa de GM)
+  function enviar(items) {
     if (!items || !items.length) return;
     GM_xmlhttpRequest({
       method:  'POST',
       url:     FEED,
       headers: { 'Content-Type': 'application/json' },
       data:    JSON.stringify(items),
-      onload:  r => { if (r.status === 200) console.log('[Surebet] ' + items.length + ' eventos enviados'); },
-      onerror: () => console.warn('[Surebet] Scanner offline — rode: node index.js'),
-    });
-  }
-
-  // Busca ativa: chama a API do Empire com os cookies da sessao do browser
-  function fetchAtivo() {
-    GM_xmlhttpRequest({
-      method:  'GET',
-      url:     API,
-      headers: { Accept: 'application/json' },
-      onload:  function(r) {
-        try {
-          const data  = JSON.parse(r.responseText);
-          const items = Array.isArray(data) ? data : (data.data || []);
-          if (items.length) {
-            console.log('[Surebet] busca ativa: ' + items.length + ' eventos');
-            send(items);
-          }
-        } catch(e) {}
+      onload: function(r) {
+        if (r.status === 200) {
+          setBadge(items.length + ' eventos enviados', '#3fb950');
+        } else {
+          setBadge('erro no scanner (' + r.status + ')', '#f85149');
+        }
       },
-      onerror: () => {},
+      onerror: function() {
+        setBadge('scanner offline — rode node index.js', '#f85149');
+      },
     });
   }
 
-  // Hook fetch (intercepta chamadas que o proprio site faz)
-  const origFetch = window.fetch;
-  window.fetch = async function (...args) {
-    const res = await origFetch.apply(this, args);
-    const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url || '');
-    if (url.includes(TARGET)) {
-      res.clone().json()
-        .then(data => send(Array.isArray(data) ? data : (data.data || [])))
-        .catch(function() {});
-    }
-    return res;
-  };
+  // Busca usando o fetch da propria pagina (mesma origem = cookies incluidos)
+  function buscarEmpire() {
+    setBadge('buscando...', '#58a6ff');
+    fetch(API, { credentials: 'include' })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var items = Array.isArray(data) ? data : (data.data || []);
+        if (items.length) {
+          enviar(items);
+        } else {
+          setBadge('0 eventos (faca login no Empire)', '#d29922');
+        }
+      })
+      .catch(function(e) {
+        setBadge('erro ao buscar Empire', '#f85149');
+        console.error('[Surebet]', e);
+      });
+  }
 
-  // Hook XHR
-  const origOpen = XMLHttpRequest.prototype.open;
-  const origSend = XMLHttpRequest.prototype.send;
-
-  XMLHttpRequest.prototype.open = function (method, url) {
-    this._sbUrl = url;
-    return origOpen.apply(this, arguments);
-  };
-
-  XMLHttpRequest.prototype.send = function () {
-    if (this._sbUrl && this._sbUrl.includes(TARGET)) {
-      this.addEventListener('load', function () {
-        try {
-          const data = JSON.parse(this.responseText);
-          send(Array.isArray(data) ? data : (data.data || []));
-        } catch(e) {}
+  // Hook fetch — intercepta chamadas que o site ja faz
+  var origFetch = window.fetch;
+  window.fetch = function() {
+    var args = arguments;
+    var url  = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url || '');
+    var prom = origFetch.apply(this, args);
+    if (url.includes('/api/v2/match-betting/flattened')) {
+      prom.then(function(res) {
+        res.clone().json().then(function(data) {
+          var items = Array.isArray(data) ? data : (data.data || []);
+          if (items.length) enviar(items);
+        }).catch(function(){});
       });
     }
-    return origSend.apply(this, arguments);
+    return prom;
   };
 
-  // Inicia busca ativa imediatamente e repete a cada 60s
-  setTimeout(fetchAtivo, 3000);
-  setInterval(fetchAtivo, INTERVAL);
+  // Inicia quando DOM estiver pronto
+  function init() {
+    buscarEmpire();
+    setInterval(buscarEmpire, INTERVAL);
+  }
 
-  console.log('[Surebet] Empire feed ativo — busca a cada 10s + interceptacao');
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
 })();
